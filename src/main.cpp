@@ -4,7 +4,6 @@
 #include <WebSocketsClient.h>
 #include "esp_system.h"
 
-
 void setupWiFi();
 void setupToken();
 void setupWebSocket();
@@ -15,15 +14,18 @@ void setupTimer();
 const char *ssid     = "WIFISSI";
 const char *password = "WIFIPASS";
 
-const char *host     = "jonloureiro-smartplug.herokuapp.com"; // your ip: 192.168.x.x
+const char *host     = "jonloureiro-embarcados.herokuapp.com"; // your ip: 192.168.x.x
 const uint16_t port  = 80; // 8080
-const char *url      = "/ws";
+const char *url      = "/socket";
 const char *protocol = "jonloureiro.dev";
-const char *user     = "user";
-const char *pass     = "password";
+const char *user     = "esp32_123";
+const char *pass     = "demo123";
 const char *agent    = "user-agent: Project/0.1";
 const char *origin   = "origin: project://id";
 
+const int sensor     = 35;
+const int rele       = 32;
+const int levelConverter = 33;
 
 hw_timer_t *watchdogTimer = NULL;
 hw_timer_t *apiTimer      = NULL;
@@ -31,11 +33,13 @@ portMUX_TYPE apiMux       = portMUX_INITIALIZER_UNLOCKED;
 
 volatile SemaphoreHandle_t apiSemaphore;
 volatile uint8_t count;
+volatile bool allowed;
 
 uint8_t countAux;
 uint32_t current;
 char current_str[5];
 bool connected;
+bool allowedAux;
 
 WebSocketsClient webSocket;
 
@@ -47,6 +51,11 @@ void setup() {
   count = 0;
   current = 0;
   connected = false;
+  allowed = false;
+
+  pinMode(rele, OUTPUT);
+  pinMode(levelConverter, OUTPUT);
+  digitalWrite(levelConverter, HIGH);
 
   delay(1000);
 
@@ -58,30 +67,44 @@ void setup() {
 
 
 void loop() {
-    Serial.print(".");
     timerWrite(watchdogTimer, 0);
+
+    portENTER_CRITICAL(&apiMux);
+    allowedAux = allowed;
+    portEXIT_CRITICAL(&apiMux);
+
+    if (allowedAux) {
+      Serial.print(".");
+      digitalWrite(rele, LOW);
+    } else {
+      Serial.print("-");
+      digitalWrite(rele, HIGH);
+    }
+
     webSocket.loop();
+
     if (xSemaphoreTake(apiSemaphore, 0) == pdTRUE) {
         portENTER_CRITICAL(&apiMux);
         countAux = count;
         portEXIT_CRITICAL(&apiMux);
         if (countAux < 10)
-            current += analogRead(36);
+            current += analogRead(sensor);
         else {
             portENTER_CRITICAL(&apiMux);
             count = 0;
             portEXIT_CRITICAL(&apiMux);
-            current += analogRead(36);
+            current += analogRead(sensor);
             current /= countAux;
             if (connected) {
                 sprintf(current_str, "%d", current);
                 webSocket.sendTXT(current_str);
                 Serial.printf("\nCorrente %s enviada!\n", current_str);
                 current = 0;
-            } // ELSE TRATAR
+            }
         }
     }
-    delay(200);
+
+    delay(250);
 }
 
 
@@ -93,9 +116,15 @@ void IRAM_ATTR resetModule() {
 
 void IRAM_ATTR apiRequest() {
     portENTER_CRITICAL_ISR(&apiMux);
-    count++;
+    bool aux = allowed;
     portEXIT_CRITICAL_ISR(&apiMux);
-    xSemaphoreGiveFromISR(apiSemaphore, NULL);
+
+    if (aux) {
+        portENTER_CRITICAL_ISR(&apiMux);
+        count++;
+        portEXIT_CRITICAL_ISR(&apiMux);
+        xSemaphoreGiveFromISR(apiSemaphore, NULL);
+    }
 }
 
 
@@ -110,7 +139,7 @@ void setupWatchdogTimer() {
 void setupTimer() {
     apiTimer = timerBegin(0, 80, true);
     timerAttachInterrupt(apiTimer, &apiRequest, true);
-    timerAlarmWrite(apiTimer, 1000000, true);
+    timerAlarmWrite(apiTimer, 500000, true);
     timerAlarmEnable(apiTimer);
 }
 
@@ -132,21 +161,6 @@ void setupWiFi() {
   setupWiFi();
 }
 
-
-// void hexdump(const void *mem, uint32_t len, uint8_t cols = 16) {
-//     const uint8_t* src = (const uint8_t*) mem;
-//     Serial.printf("\n[HEXDUMP] Address: 0x%08X len: 0x%X (%d)", (ptrdiff_t)src, len, len);
-//     for(uint32_t i = 0; i < len; i++) {
-//         if(i % cols == 0) {
-//             Serial.printf("\n[0x%08X] 0x%08X: ", (ptrdiff_t)src, i);
-//         }
-//         Serial.printf("%02X ", *src);
-//         src++;
-//     }
-//     Serial.printf("\n");
-// }
-
-
 void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
     switch(type) {
         case WStype_DISCONNECTED:
@@ -161,11 +175,20 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
 
         case WStype_TEXT:
             Serial.printf("\nGet text: %s\n", payload);
+
+            if (payload[1] == 't') {
+                portENTER_CRITICAL(&apiMux);
+                    allowed = true;
+                portEXIT_CRITICAL(&apiMux);
+            } else if (payload[1] == 'f') {
+                portENTER_CRITICAL(&apiMux);
+                    allowed = false;
+                portEXIT_CRITICAL(&apiMux);
+            }
             break;
 
         case WStype_BIN:
             Serial.printf("\nGet binary length: %u\n", length);
-            // hexdump(payload, length);
             break;
 
         case WStype_ERROR:
